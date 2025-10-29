@@ -16,6 +16,11 @@ import {
   CampaignVideosResponse,
 } from "../types/video";
 import {
+  ChannelFetchRequest,
+  ChannelFetchResponse,
+  CampaignChannelsResponse,
+} from "../types/channel";
+import {
   ScoreCampaignResponse,
   ScoreVideoRequest,
   BatchScoreRequest,
@@ -80,8 +85,16 @@ export const VideoAPI = {
     const response = await apiClient.post<VideoFetchResponse>('/api/youtube/fetch', payload);
     return response.data;
   },
+  async fetchChannels(payload: ChannelFetchRequest) {
+    const response = await apiClient.post<ChannelFetchResponse>('/api/youtube/fetch/channels', payload);
+    return response.data;
+  },
   async listCampaignVideos(campaignId: string, params: { skip?: number; limit?: number } = {}) {
     const response = await apiClient.get<CampaignVideosResponse>(`/api/youtube/videos/${campaignId}`, { params });
+    return response.data;
+  },
+  async listCampaignChannels(campaignId: string, params: { skip?: number; limit?: number } = {}) {
+    const response = await apiClient.get<CampaignChannelsResponse>(`/api/youtube/channels/${campaignId}`, { params });
     return response.data;
   },
   async testConnection() {

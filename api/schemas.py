@@ -253,12 +253,45 @@ class YouTubeFetchRequest(BaseModel):
     order: str = Field(default="relevance", description="Sort order: relevance, date, rating, viewCount, title")
     video_duration: Optional[str] = Field(None, description="Duration filter: any, short, medium, long")
     video_definition: Optional[str] = Field(None, description="Definition filter: any, standard, high")
+    include_channels: bool = Field(default=True, description="Whether to fetch channels alongside videos")
+    channel_max_results: Optional[int] = Field(
+        default=25,
+        ge=1,
+        le=100,
+        description="Maximum channels per keyword rotation when include_channels is true"
+    )
+    channel_order: Optional[str] = Field(
+        default=None,
+        description="Sort order for channel discovery (defaults to the video order value when omitted)"
+    )
     
     class Config:
         json_schema_extra = {
             "example": {
                 "campaign_id": "123e4567-e89b-12d3-a456-426614174000",
                 "max_results": 50,
+                "language": "en",
+                "region": "US",
+                "order": "relevance",
+                "include_channels": True,
+                "channel_max_results": 25
+            }
+        }
+
+
+class YouTubeChannelFetchRequest(BaseModel):
+    """Schema for YouTube channel fetch request."""
+    campaign_id: str = Field(..., description="Campaign UUID")
+    max_results: int = Field(default=25, ge=1, le=100, description="Maximum channels per keyword rotation")
+    language: str = Field(default="en", description="Language code for relevance weighting")
+    region: str = Field(default="US", description="Region code influencing search results")
+    order: str = Field(default="relevance", description="Sort order: relevance, date, rating, viewCount")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "campaign_id": "123e4567-e89b-12d3-a456-426614174000",
+                "max_results": 25,
                 "language": "en",
                 "region": "US",
                 "order": "relevance"
@@ -287,6 +320,28 @@ class YouTubeVideoResponse(BaseModel):
     thumbnail_url: Optional[str]
     fetched_at: datetime
     
+    class Config:
+        from_attributes = True
+
+
+class YouTubeChannelResponse(BaseModel):
+    """Schema for YouTube channel response."""
+    id: str
+    campaign_id: str
+    channel_id: str
+    title: str
+    description: Optional[str]
+    custom_url: Optional[str]
+    country: Optional[str]
+    published_at: Optional[datetime]
+    thumbnail_url: Optional[str]
+    keywords: Optional[List[str]]
+    topic_categories: Optional[List[str]]
+    subscriber_count: Optional[int]
+    view_count: Optional[int]
+    video_count: Optional[int]
+    fetched_at: datetime
+
     class Config:
         from_attributes = True
 

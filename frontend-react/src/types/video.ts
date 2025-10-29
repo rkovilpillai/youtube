@@ -1,3 +1,5 @@
+import type { ChannelResponseItem } from "./channel";
+
 export interface VideoFetchRequest {
   campaign_id: string;
   max_results: number;
@@ -6,6 +8,9 @@ export interface VideoFetchRequest {
   published_after?: string | null;
   published_before?: string | null;
   order: string;
+  include_channels?: boolean;
+  channel_max_results?: number;
+  channel_order?: string | null;
 }
 
 export interface VideoResponseItem {
@@ -34,6 +39,12 @@ export interface VideoFetchResponse {
     new_videos: number;
     duplicate_videos: number;
     quota_used: number;
+    video_quota_used?: number;
+    channels?: ChannelResponseItem[];
+    total_channels?: number;
+    new_channels?: number;
+    duplicate_channels?: number;
+    channel_quota_used?: number;
   };
 }
 

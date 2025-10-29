@@ -4,12 +4,13 @@ Handles video fetching, metadata retrieval, and channel information.
 """
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 import logging
 from collections import defaultdict
+import shlex
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -19,11 +20,19 @@ from youtube_transcript_api import (
 )
 
 from api.config import settings
-from api.models import YouTubeVideo, Keyword, KeywordStatus, KeywordType
+from api.models import YouTubeVideo, YouTubeChannel, Keyword, KeywordStatus, KeywordType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+KEYWORD_TYPE_WEIGHTS = {
+    KeywordType.CORE: 0.50,
+    KeywordType.RELATED: 0.25,
+    KeywordType.INTENT_BASED: 0.15,
+    KeywordType.LONG_TAIL: 0.10,
+}
 
 
 class YouTubeService:
@@ -46,6 +55,139 @@ class YouTubeService:
         except Exception as e:
             logger.error(f"❌ Failed to initialize YouTube API client: {e}")
             raise Exception(f"YouTube API initialization failed: {str(e)}")
+
+    def _select_keywords_for_rotation(
+        self,
+        keywords: List[Keyword],
+        max_keyword_budget: int = 20,
+        weight_map: Optional[Dict[KeywordType, float]] = None
+    ) -> Tuple[List[Keyword], Dict[KeywordType, int]]:
+        """
+        Select a diversified set of keywords for search rotation.
+
+        Args:
+            keywords: Active keyword objects for a campaign.
+            max_keyword_budget: Maximum number of keywords to rotate through.
+            weight_map: Optional weighting (0-1 range, not required to sum to 1) per keyword type.
+                        Higher weights receive more slots before graceful fallbacks fill the rest.
+
+        Returns:
+            Tuple of (selected keywords, selection mix summary).
+        """
+        if not keywords:
+            raise ValueError("No active keywords found for campaign")
+
+        max_keyword_budget = min(len(keywords), max_keyword_budget)
+        if max_keyword_budget <= 0:
+            raise ValueError("No eligible keywords available for selection")
+
+        keywords_by_type: Dict[KeywordType, List[Keyword]] = defaultdict(list)
+        for kw in keywords:
+            keywords_by_type[kw.keyword_type].append(kw)
+
+        def keyword_priority_key(kw: Keyword):
+            total_results = kw.total_results or 0
+            last_fetch = kw.last_fetched_at or datetime.min
+            return (total_results, last_fetch, -kw.relevance_score)
+
+        for kw_type in keywords_by_type:
+            keywords_by_type[kw_type].sort(key=keyword_priority_key)
+
+        ordered_types = [
+            KeywordType.CORE,
+            KeywordType.RELATED,
+            KeywordType.INTENT_BASED,
+            KeywordType.LONG_TAIL,
+        ]
+        available_types = [kw_type for kw_type in ordered_types if keywords_by_type.get(kw_type)]
+        extra_types = [kw_type for kw_type in keywords_by_type.keys() if kw_type not in available_types]
+        available_types.extend(extra_types)
+        if not available_types:
+            raise ValueError("Unable to select keywords for fetch request")
+
+        weights = weight_map or {}
+        positive_weight_sum = sum(max(weights.get(kw_type, 0.0), 0.0) for kw_type in available_types)
+        if positive_weight_sum <= 0:
+            normalized_weights = {kw_type: 1.0 / len(available_types) for kw_type in available_types}
+        else:
+            normalized_weights = {
+                kw_type: max(weights.get(kw_type, 0.0), 0.0) / positive_weight_sum
+                for kw_type in available_types
+            }
+
+        allocation: Dict[KeywordType, int] = {kw_type: 0 for kw_type in available_types}
+        fractional_allocation: List[Tuple[float, KeywordType]] = []
+        total_assigned = 0
+
+        for kw_type in available_types:
+            desired = max_keyword_budget * normalized_weights.get(kw_type, 0.0)
+            base_take = min(len(keywords_by_type[kw_type]), int(desired))
+            allocation[kw_type] = base_take
+            total_assigned += base_take
+            fractional_allocation.append((desired - base_take, kw_type))
+
+        remaining_slots = max_keyword_budget - total_assigned
+
+        # Allocate remaining slots by descending fractional remainder while respecting bucket capacity.
+        if remaining_slots > 0:
+            fractional_allocation.sort(reverse=True)
+            idx = 0
+            iterations = 0
+            max_iterations = max(len(fractional_allocation) * 5, 1)
+            while remaining_slots > 0 and fractional_allocation and iterations < max_iterations:
+                fraction, kw_type = fractional_allocation[idx % len(fractional_allocation)]
+                if allocation[kw_type] < len(keywords_by_type[kw_type]):
+                    allocation[kw_type] += 1
+                    remaining_slots -= 1
+                idx += 1
+                iterations += 1
+
+        # Graceful fallback: if slots remain, distribute by weight priority wherever capacity exists.
+        if remaining_slots > 0:
+            prioritized_types = sorted(
+                available_types,
+                key=lambda t: (normalized_weights.get(t, 0.0), len(keywords_by_type[t])),
+                reverse=True
+            )
+            for kw_type in prioritized_types:
+                while remaining_slots > 0 and allocation[kw_type] < len(keywords_by_type[kw_type]):
+                    allocation[kw_type] += 1
+                    remaining_slots -= 1
+            # As a final guard, if slots still remain (unlikely), fall back to any remaining keywords.
+
+        selected_keywords: List[Keyword] = []
+        selection_summary: Dict[KeywordType, int] = defaultdict(int)
+        selected_ids: Set[str] = set()
+
+        for kw_type in available_types:
+            bucket = keywords_by_type[kw_type]
+            take = min(allocation.get(kw_type, 0), len(bucket))
+            for kw in bucket[:take]:
+                if kw.id not in selected_ids:
+                    selected_keywords.append(kw)
+                    selection_summary[kw.keyword_type] += 1
+                    selected_ids.add(kw.id)
+
+        if len(selected_keywords) < max_keyword_budget:
+            remaining_needed = max_keyword_budget - len(selected_keywords)
+            leftover_candidates: List[Keyword] = []
+            for kw_type, bucket in keywords_by_type.items():
+                leftover_candidates.extend(bucket[allocation.get(kw_type, 0):])
+            leftover_candidates.sort(key=keyword_priority_key)
+            for kw in leftover_candidates:
+                if kw.id in selected_ids:
+                    continue
+                selected_keywords.append(kw)
+                selection_summary[kw.keyword_type] += 1
+                selected_ids.add(kw.id)
+                remaining_needed -= 1
+                if remaining_needed <= 0:
+                    break
+
+        if not selected_keywords:
+            raise ValueError("Unable to select keywords for fetch request")
+
+        return selected_keywords, selection_summary
     
     def search_videos(
         self,
@@ -144,6 +286,77 @@ class YouTubeService:
         logger.info(f"Total unique videos found: {len(all_video_ids)}")
         return list(all_video_ids), keyword_results
 
+    def search_channels(
+        self,
+        keywords: List[str],
+        max_results_per_keyword: int = 10,
+        language: str = "en",
+        region: str = "US",
+        order: str = "relevance"
+    ) -> Tuple[List[str], Dict[str, List[str]]]:
+        """
+        Search for channels using campaign keywords.
+
+        Args:
+            keywords: List of search keywords.
+            max_results_per_keyword: Maximum channels per keyword (1-50).
+            language: Language bias (ISO 639-1).
+            region: Region code (ISO 3166-1 alpha-2).
+            order: Sort order (relevance, date, rating, viewCount, videoCount).
+
+        Returns:
+            Tuple containing:
+                - List of unique channel IDs.
+                - Mapping of keyword -> channel IDs returned.
+        """
+        all_channel_ids = set()
+        keyword_results: Dict[str, List[str]] = {}
+
+        for keyword in keywords:
+            try:
+                logger.info(f"Searching channels for keyword: {keyword}")
+
+                search_params = {
+                    'part': 'id',
+                    'q': keyword,
+                    'type': 'channel',
+                    'maxResults': min(max_results_per_keyword, 50),
+                    'relevanceLanguage': language,
+                    'regionCode': region,
+                    'order': order
+                }
+
+                search_request = self.youtube.search().list(**search_params)
+                search_response = search_request.execute()
+
+                # Track quota usage (search.list costs 100 units regardless of type)
+                self.quota_used += 100
+
+                channel_ids = [
+                    item['id']['channelId']
+                    for item in search_response.get('items', [])
+                    if item['id']['kind'] == 'youtube#channel'
+                ]
+
+                all_channel_ids.update(channel_ids)
+                keyword_results[keyword] = channel_ids
+                logger.info(f"Found {len(channel_ids)} channels for keyword: {keyword}")
+
+            except HttpError as e:
+                logger.error(f"YouTube API error for channel keyword '{keyword}': {e}")
+                if e.resp.status == 403:
+                    logger.error("Quota exceeded or API key invalid!")
+                    raise Exception("YouTube API quota exceeded or invalid API key")
+                keyword_results[keyword] = []
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error searching channels for '{keyword}': {e}")
+                keyword_results[keyword] = []
+                continue
+
+        logger.info(f"Total unique channels found: {len(all_channel_ids)}")
+        return list(all_channel_ids), keyword_results
+
     def get_channel_statistics(self, channel_id: str) -> Dict[str, Any]:
         """Retrieve channel statistics (subscriber/view counts)."""
         if not hasattr(self, "_channel_stats_cache"):
@@ -172,6 +385,123 @@ class YouTubeService:
             logger.warning(f"Failed to fetch channel stats for {channel_id}: {exc}")
 
         return {}
+
+    def get_channel_details(self, channel_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Retrieve detailed channel metadata and statistics.
+
+        Args:
+            channel_ids: List of YouTube channel IDs (max 50 per request)
+
+        Returns:
+            List of channel data dictionaries ready for persistence.
+        """
+        if not channel_ids:
+            return []
+
+        channel_data_list: List[Dict[str, Any]] = []
+        batch_size = 50
+
+        for i in range(0, len(channel_ids), batch_size):
+            batch = channel_ids[i:i + batch_size]
+            try:
+                logger.info(f"Fetching details for {len(batch)} channels (batch {i // batch_size + 1})")
+                request = self.youtube.channels().list(
+                    part='snippet,statistics,brandingSettings,topicDetails',
+                    id=','.join(batch)
+                )
+                response = request.execute()
+
+                # Track quota usage (channels.list costs 1 unit per channel in the batch)
+                self.quota_used += len(batch)
+
+                for item in response.get('items', []):
+                    try:
+                        snippet = item.get('snippet', {}) or {}
+                        statistics = item.get('statistics', {}) or {}
+                        branding = (item.get('brandingSettings', {}) or {}).get('channel', {}) or {}
+                        topic_details = item.get('topicDetails', {}) or {}
+
+                        channel_id = item.get('id')
+                        if not channel_id:
+                            continue
+
+                        keywords_raw = branding.get('keywords')
+                        keywords_list = None
+                        if keywords_raw:
+                            try:
+                                keywords_list = shlex.split(keywords_raw)
+                            except ValueError:
+                                keywords_list = [kw.strip() for kw in keywords_raw.split(",") if kw.strip()]
+
+                        topic_categories = topic_details.get('topicCategories')
+                        if topic_categories:
+                            topic_categories = [topic for topic in topic_categories if topic]
+
+                        thumbnail_url = None
+                        thumbnails = snippet.get('thumbnails', {})
+                        for preferred_key in ('high', 'medium', 'default'):
+                            if thumbnails.get(preferred_key, {}).get('url'):
+                                thumbnail_url = thumbnails[preferred_key]['url']
+                                break
+
+                        subscriber_count = statistics.get('subscriberCount')
+                        if subscriber_count is not None:
+                            try:
+                                subscriber_count = int(subscriber_count)
+                            except (TypeError, ValueError):
+                                subscriber_count = None
+
+                        view_count = statistics.get('viewCount')
+                        if view_count is not None:
+                            try:
+                                view_count = int(view_count)
+                            except (TypeError, ValueError):
+                                view_count = None
+
+                        video_count = statistics.get('videoCount')
+                        if video_count is not None:
+                            try:
+                                video_count = int(video_count)
+                            except (TypeError, ValueError):
+                                video_count = None
+
+                        if not hasattr(self, "_channel_stats_cache"):
+                            self._channel_stats_cache = {}
+                        self._channel_stats_cache[channel_id] = {
+                            'subscriberCount': subscriber_count,
+                            'viewCount': view_count,
+                            'videoCount': video_count
+                        }
+
+                        channel_data_list.append({
+                            'channel_id': channel_id,
+                            'title': snippet.get('title', ''),
+                            'description': snippet.get('description'),
+                            'custom_url': snippet.get('customUrl'),
+                            'country': snippet.get('country'),
+                            'published_at': self._parse_datetime(snippet.get('publishedAt')),
+                            'thumbnail_url': thumbnail_url,
+                            'keywords': keywords_list,
+                            'topic_categories': topic_categories,
+                            'subscriber_count': subscriber_count,
+                            'view_count': view_count,
+                            'video_count': video_count
+                        })
+                    except Exception as item_exc:
+                        logger.warning(f"Failed to process channel payload: {item_exc}")
+                        continue
+
+            except HttpError as e:
+                logger.error(f"YouTube API error fetching channel details: {e}")
+                if e.resp.status == 403:
+                    raise Exception("YouTube API quota exceeded or invalid API key")
+                continue
+            except Exception as exc:
+                logger.error(f"Unexpected error fetching channel details: {exc}")
+                continue
+
+        return channel_data_list
     
     def get_video_details(self, video_ids: List[str]) -> List[Dict[str, Any]]:
         """
@@ -316,67 +646,11 @@ class YouTubeService:
         
         logger.info(f"Fetching videos for campaign {campaign_id} with {len(keywords)} active keywords")
         
-        # Determine diversified keyword selection (balanced across types, prioritising low coverage and stale queries)
-        max_keyword_budget = min(len(keywords), 20)
-        if max_keyword_budget == 0:
-            raise ValueError("No eligible keywords available for selection")
-        
-        keywords_by_type: Dict[KeywordType, List[Keyword]] = defaultdict(list)
-        for kw in keywords:
-            keywords_by_type[kw.keyword_type].append(kw)
-        
-        def keyword_priority_key(kw: Keyword):
-            total_results = kw.total_results or 0
-            last_fetch = kw.last_fetched_at or datetime.min
-            return (total_results, last_fetch, -kw.relevance_score)
-        
-        for kw_type in keywords_by_type:
-            keywords_by_type[kw_type].sort(key=keyword_priority_key)
-        
-        keyword_type_order = [KeywordType.CORE, KeywordType.LONG_TAIL, KeywordType.RELATED, KeywordType.INTENT_BASED]
-        available_types = [kw_type for kw_type in keyword_type_order if keywords_by_type.get(kw_type)]
-        if not available_types:
-            # Fall back to any keyword types present
-            available_types = list(keywords_by_type.keys())
-        
-        selected_keywords: List[Keyword] = []
-        if available_types:
-            base_share = max_keyword_budget // len(available_types)
-            extra_slots = max_keyword_budget % len(available_types)
-            used_keyword_ids = set()
-            
-            # Initial allocation per type
-            for kw_type in available_types:
-                bucket = keywords_by_type.get(kw_type, [])
-                if not bucket:
-                    continue
-                share = base_share
-                if extra_slots > 0:
-                    share += 1
-                    extra_slots -= 1
-                take = min(share, len(bucket))
-                selected_keywords.extend(bucket[:take])
-                used_keyword_ids.update(kw.id for kw in bucket[:take])
-            
-            # Fill any remaining slots with best remaining keywords regardless of type
-            if len(selected_keywords) < max_keyword_budget:
-                remaining_candidates = [
-                    kw for bucket in keywords_by_type.values() for kw in bucket
-                    if kw.id not in used_keyword_ids
-                ]
-                remaining_candidates.sort(key=keyword_priority_key)
-                take_count = max_keyword_budget - len(selected_keywords)
-                selected_keywords.extend(remaining_candidates[:take_count])
-        else:
-            # Should not happen, but fallback to top keywords globally
-            selected_keywords = sorted(keywords, key=keyword_priority_key)[:max_keyword_budget]
-        
-        if not selected_keywords:
-            raise ValueError("Unable to select keywords for fetch request")
-        
-        selection_summary = defaultdict(int)
-        for kw in selected_keywords:
-            selection_summary[kw.keyword_type] += 1
+        selected_keywords, selection_summary = self._select_keywords_for_rotation(
+            keywords,
+            max_keyword_budget=min(len(keywords), 20),
+            weight_map=KEYWORD_TYPE_WEIGHTS
+        )
         logger.info(
             "Keyword selection mix: %s",
             ", ".join(f"{kw_type.value}:{count}" for kw_type, count in selection_summary.items())
@@ -477,6 +751,125 @@ class YouTubeService:
             'total_videos': total_videos,
             'quota_used': self.quota_used
         }
+
+    def fetch_channels_for_campaign(
+        self,
+        db: Session,
+        campaign_id: str,
+        max_results: int = 25,
+        language: str = "en",
+        region: str = "US",
+        order: str = "relevance"
+    ) -> Dict[str, Any]:
+        """
+        Fetch YouTube channels for a campaign using its keywords.
+
+        Args:
+            db: Database session.
+            campaign_id: Campaign UUID.
+            max_results: Maximum channels to fetch across all keywords.
+            language: Language bias.
+            region: Region code.
+            order: Sort order.
+
+        Returns:
+            Dictionary describing persistence outcome.
+        """
+        self.quota_used = 0
+
+        keywords = db.query(Keyword).filter(
+            Keyword.campaign_id == campaign_id,
+            Keyword.status == KeywordStatus.ACTIVE
+        ).order_by(Keyword.relevance_score.desc()).all()
+
+        if not keywords:
+            raise ValueError("No active keywords found for campaign")
+
+        selected_keywords, selection_summary = self._select_keywords_for_rotation(
+            keywords,
+            max_keyword_budget=min(len(keywords), 20),
+            weight_map=KEYWORD_TYPE_WEIGHTS
+        )
+        logger.info(
+            "Channel keyword selection mix: %s",
+            ", ".join(f"{kw_type.value}:{count}" for kw_type, count in selection_summary.items())
+        )
+
+        keyword_texts = [kw.keyword for kw in selected_keywords]
+        max_per_keyword = max(1, max_results // len(keyword_texts))
+
+        channel_ids, _keyword_hits = self.search_channels(
+            keywords=keyword_texts,
+            max_results_per_keyword=max_per_keyword,
+            language=language,
+            region=region,
+            order=order
+        )
+
+        if not channel_ids:
+            total_channels = db.query(YouTubeChannel).filter(
+                YouTubeChannel.campaign_id == campaign_id
+            ).count()
+            return {
+                'channels': [],
+                'new_channels': 0,
+                'duplicate_channels': 0,
+                'total_channels': total_channels,
+                'quota_used': self.quota_used
+            }
+
+        channels_data = self.get_channel_details(channel_ids)
+        new_channels: List[YouTubeChannel] = []
+        duplicate_count = 0
+
+        existing_channels: Dict[str, YouTubeChannel] = {}
+        channel_ids_to_check = [data['channel_id'] for data in channels_data if data.get('channel_id')]
+        if channel_ids_to_check:
+            existing_channels = {
+                ch.channel_id: ch
+                for ch in db.query(YouTubeChannel).filter(
+                    YouTubeChannel.channel_id.in_(channel_ids_to_check)
+                ).all()
+            }
+
+        for channel_data in channels_data:
+            channel_id = channel_data.get('channel_id')
+            if not channel_id:
+                continue
+
+            if channel_id in existing_channels:
+                duplicate_count += 1
+                continue
+
+            youtube_channel = YouTubeChannel(
+                campaign_id=campaign_id,
+                **channel_data
+            )
+            db.add(youtube_channel)
+            new_channels.append(youtube_channel)
+
+        try:
+            db.commit()
+            logger.info(f"✅ Saved {len(new_channels)} new channels, skipped {duplicate_count} duplicates")
+        except Exception as exc:
+            db.rollback()
+            logger.error(f"❌ Failed to save channels: {exc}")
+            raise Exception(f"Database error: {str(exc)}")
+
+        for channel in new_channels:
+            db.refresh(channel)
+
+        total_channels = db.query(YouTubeChannel).filter(
+            YouTubeChannel.campaign_id == campaign_id
+        ).count()
+
+        return {
+            'channels': new_channels,
+            'new_channels': len(new_channels),
+            'duplicate_channels': duplicate_count,
+            'total_channels': total_channels,
+            'quota_used': self.quota_used
+        }
     
     def get_campaign_videos(
         self,
@@ -504,6 +897,34 @@ class YouTubeService:
         ).limit(limit).offset(offset).all()
         
         return videos
+
+    def get_campaign_channels(
+        self,
+        db: Session,
+        campaign_id: str,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[YouTubeChannel]:
+        """
+        Retrieve stored channels for a campaign.
+
+        Args:
+            db: Database session.
+            campaign_id: Campaign UUID.
+            limit: Record limit.
+            offset: Pagination offset.
+
+        Returns:
+            List of YouTubeChannel objects.
+        """
+        channels = db.query(YouTubeChannel).filter(
+            YouTubeChannel.campaign_id == campaign_id
+        ).order_by(
+            YouTubeChannel.subscriber_count.desc().nullslast(),
+            YouTubeChannel.view_count.desc().nullslast()
+        ).limit(limit).offset(offset).all()
+
+        return channels
     
     def get_video_metadata(self, video_id: str) -> Dict[str, Any]:
         """Fetch snippet, statistics, and content details for a video."""

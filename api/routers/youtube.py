@@ -9,8 +9,13 @@ from datetime import datetime
 import logging
 
 from api.database import get_db
-from api.models import YouTubeVideo, Campaign
-from api.schemas import YouTubeFetchRequest, YouTubeVideoResponse
+from api.models import YouTubeVideo, YouTubeChannel, Campaign
+from api.schemas import (
+    YouTubeFetchRequest,
+    YouTubeVideoResponse,
+    YouTubeChannelFetchRequest,
+    YouTubeChannelResponse
+)
 from api.services.youtube_service import youtube_service
 
 # Configure logging
@@ -119,10 +124,11 @@ def fetch_youtube_videos(
         # Convert to response models
         videos = fetch_result.get('videos', [])
         videos_response = [YouTubeVideoResponse.model_validate(v) for v in videos]
+        video_quota = fetch_result.get('quota_used', youtube_service.quota_used)
         
         logger.info(f"Fetched {fetch_result.get('new_videos', len(videos))} videos for campaign {request.campaign_id}")
         
-        return {
+        response_payload = {
             "success": True,
             "data": {
                 "campaign_id": request.campaign_id,
@@ -130,11 +136,48 @@ def fetch_youtube_videos(
                 "duplicate_videos": fetch_result.get('duplicate_videos', 0),
                 "total_videos": fetch_result.get('total_videos', len(videos)),
                 "videos": [v.model_dump() for v in videos_response],
-                "quota_used": fetch_result.get('quota_used', youtube_service.quota_used)
+                "video_quota_used": video_quota,
+                "quota_used": video_quota
             },
             "message": f"Successfully fetched {len(videos)} videos",
             "timestamp": datetime.utcnow().isoformat()
         }
+
+        if request.include_channels:
+            channel_max_results = request.channel_max_results or 25
+            channel_order = request.channel_order or request.order
+
+            channel_fetch_result = youtube_service.fetch_channels_for_campaign(
+                db=db,
+                campaign_id=request.campaign_id,
+                max_results=channel_max_results,
+                language=language,
+                region=region,
+                order=channel_order
+            )
+
+            channels = channel_fetch_result.get('channels', [])
+            channel_response = [YouTubeChannelResponse.model_validate(ch) for ch in channels]
+            channel_quota = channel_fetch_result.get('quota_used', youtube_service.quota_used)
+
+            response_payload["data"].update(
+                {
+                    "channels": [c.model_dump() for c in channel_response],
+                    "new_channels": channel_fetch_result.get('new_channels', len(channels)),
+                    "duplicate_channels": channel_fetch_result.get('duplicate_channels', 0),
+                    "total_channels": channel_fetch_result.get('total_channels', len(channels)),
+                    "channel_quota_used": channel_quota,
+                    "quota_used": response_payload["data"]["quota_used"] + channel_quota,
+                }
+            )
+            logger.info(
+                "Channel discovery for campaign %s added %d new channels (duplicates: %d)",
+                request.campaign_id,
+                channel_fetch_result.get('new_channels', len(channels)),
+                channel_fetch_result.get('duplicate_channels', 0)
+            )
+
+        return response_payload
         
     except HTTPException:
         raise
@@ -160,6 +203,88 @@ def fetch_youtube_videos(
                 "error": {
                     "code": "FETCH_ERROR",
                     "message": f"Failed to fetch videos: {str(e)}"
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+
+
+@router.post("/fetch/channels", response_model=dict)
+def fetch_youtube_channels(
+    request: YouTubeChannelFetchRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Fetch YouTube channels for a campaign using its keywords.
+    """
+    try:
+        campaign = db.query(Campaign).filter(Campaign.id == request.campaign_id).first()
+        if not campaign:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "success": False,
+                    "error": {
+                        "code": "CAMPAIGN_NOT_FOUND",
+                        "message": f"Campaign with id {request.campaign_id} not found"
+                    },
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            )
+
+        language = request.language or campaign.primary_language or "en"
+        region = request.region or campaign.primary_market or "US"
+
+        fetch_result = youtube_service.fetch_channels_for_campaign(
+            db=db,
+            campaign_id=request.campaign_id,
+            max_results=request.max_results,
+            language=language,
+            region=region,
+            order=request.order
+        )
+
+        channels = fetch_result.get('channels', [])
+        channel_response = [YouTubeChannelResponse.model_validate(ch) for ch in channels]
+
+        return {
+            "success": True,
+            "data": {
+                "campaign_id": request.campaign_id,
+                "new_channels": fetch_result.get('new_channels', len(channels)),
+                "duplicate_channels": fetch_result.get('duplicate_channels', 0),
+                "total_channels": fetch_result.get('total_channels', len(channels)),
+                "channels": [c.model_dump() for c in channel_response],
+                "quota_used": fetch_result.get('quota_used', youtube_service.quota_used)
+            },
+            "message": f"Successfully fetched {len(channels)} channels",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        logger.error(f"Validation error during channel fetch: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "success": False,
+                "error": {
+                    "code": "VALIDATION_ERROR",
+                    "message": str(exc)
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+    except Exception as exc:
+        logger.error(f"Failed to fetch channels: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "success": False,
+                "error": {
+                    "code": "FETCH_ERROR",
+                    "message": f"Failed to fetch channels: {str(exc)}"
                 },
                 "timestamp": datetime.utcnow().isoformat()
             }
@@ -223,6 +348,58 @@ def get_campaign_videos(
                 "error": {
                     "code": "RETRIEVAL_ERROR",
                     "message": f"Failed to retrieve videos: {str(e)}"
+                },
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+
+
+@router.get("/channels/{campaign_id}", response_model=dict)
+def get_campaign_channels(
+    campaign_id: str,
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """
+    Get all stored channels for a campaign.
+    """
+    try:
+        channels = youtube_service.get_campaign_channels(
+            db=db,
+            campaign_id=campaign_id,
+            limit=limit,
+            offset=skip
+        )
+
+        total_count = db.query(YouTubeChannel).filter(
+            YouTubeChannel.campaign_id == campaign_id
+        ).count()
+
+        channel_response = [YouTubeChannelResponse.model_validate(ch) for ch in channels]
+
+        return {
+            "success": True,
+            "data": {
+                "campaign_id": campaign_id,
+                "total_channels": total_count,
+                "returned_channels": len(channels),
+                "skip": skip,
+                "limit": limit,
+                "channels": [c.model_dump() for c in channel_response]
+            },
+            "message": f"Retrieved {len(channels)} channels",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as exc:
+        logger.error(f"Failed to retrieve channels: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "success": False,
+                "error": {
+                    "code": "RETRIEVAL_ERROR",
+                    "message": f"Failed to retrieve channels: {str(exc)}"
                 },
                 "timestamp": datetime.utcnow().isoformat()
             }

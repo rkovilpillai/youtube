@@ -42,6 +42,6 @@ def init_db():
     Initialize database by creating all tables.
     Should be called on application startup.
     """
-    from api.models import Campaign, Keyword, YouTubeVideo, VideoScore  # Import models to register metadata
+    from api.models import Campaign, Keyword, YouTubeVideo, VideoScore, YouTubeChannel  # Import models to register metadata
     Base.metadata.create_all(bind=engine)
     print("✅ Database initialized successfully")

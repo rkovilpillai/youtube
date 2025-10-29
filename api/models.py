@@ -121,12 +121,61 @@ class Campaign(Base):
     # Relationships
     keywords = relationship("Keyword", back_populates="campaign", cascade="all, delete-orphan")
     videos = relationship("YouTubeVideo", back_populates="campaign", cascade="all, delete-orphan")
+    channels = relationship("YouTubeChannel", back_populates="campaign", cascade="all, delete-orphan")
     avg_view_count = Column(Float, nullable=True)
     avg_like_count = Column(Float, nullable=True)
     avg_comment_count = Column(Float, nullable=True)
     
     def __repr__(self):
         return f"<Campaign(id={self.id}, name={self.name}, brand={self.brand_name})>"
+
+
+class YouTubeChannel(Base):
+    """
+    YouTube channel model for storing discovered channel metadata.
+
+    Attributes:
+        id: Primary key (UUID)
+        campaign_id: Foreign key to campaigns table
+        channel_id: YouTube channel ID
+        title: Channel title
+        description: Channel description text
+        custom_url: Vanity/custom URL if available
+        country: Channel country if provided
+        published_at: Channel creation date
+        thumbnail_url: Default high-res thumbnail
+        keywords: Channel keywords declared by creator
+        topic_categories: YouTube provided topic categories
+        subscriber_count: Subscriber count (may be hidden)
+        view_count: Total channel views
+        video_count: Total uploaded videos
+        fetched_at: Timestamp of when the channel was stored
+    """
+    __tablename__ = "youtube_channels"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    campaign_id = Column(String(36), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False)
+    channel_id = Column(String(30), unique=True, nullable=False, index=True)
+
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    custom_url = Column(String(255), nullable=True)
+    country = Column(String(5), nullable=True)
+    published_at = Column(DateTime, nullable=True)
+    thumbnail_url = Column(Text, nullable=True)
+    keywords = Column(JSON, nullable=True)
+    topic_categories = Column(JSON, nullable=True)
+
+    subscriber_count = Column(Integer, nullable=True)
+    view_count = Column(Integer, nullable=True)
+    video_count = Column(Integer, nullable=True)
+
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    campaign = relationship("Campaign", back_populates="channels")
+
+    def __repr__(self):
+        return f"<YouTubeChannel(channel_id={self.channel_id}, title={self.title})>"
 
 
 class Keyword(Base):
