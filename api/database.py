@@ -2,12 +2,21 @@
 Database connection and session management for YouTube Contextual Product Pipeline.
 Uses SQLAlchemy ORM with SQLite (migration-ready to PostgreSQL).
 """
+from pathlib import Path
+
 from sqlalchemy import create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
 from api.config import settings
 
 # Create database engine
+if settings.database_url.startswith("sqlite"):
+    url = make_url(settings.database_url)
+    if url.database:
+        Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+
 engine = create_engine(
     settings.database_url,
     connect_args={"check_same_thread": False} if "sqlite" in settings.database_url else {},
