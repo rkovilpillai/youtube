@@ -1,0 +1,63 @@
+# YouTube Contextual Product Pipeline - Requirements
+# Python 3.9+
+
+# FastAPI Backend
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1  # For future migrations
+
+# Data Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# OpenAI Integration (Liz AI)
+openai==1.3.7
+
+# YouTube Data API v3
+google-api-python-client==2.108.0
+google-auth-httplib2==0.1.1
+google-auth-oauthlib==1.1.0
+
+# Transcripts & NLP helpers
+youtube-transcript-api==0.6.2
+
+# Streamlit Frontend
+streamlit==1.28.2
+streamlit-option-menu==0.3.6  # Optional: for better navigation
+
+# HTTP Requests
+requests==2.31.0
+httpx==0.25.1
+
+# Data Processing
+pandas==2.1.3
+numpy==1.26.2
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# JSON Schema Validation
+jsonschema==4.20.0
+
+# Logging & Monitoring
+python-json-logger==2.0.7
+
+# Testing (Development)
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.25.1  # For testing async endpoints
+
+# Code Quality (Development)
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+isort==5.12.0
+
+# Documentation
+mkdocs==1.5.3  # Optional: for documentation
+mkdocs-material==9.4.14  # Optional: theme for docs
