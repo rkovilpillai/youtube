@@ -2,6 +2,7 @@
 Database connection and session management for YouTube Contextual Product Pipeline.
 Uses SQLAlchemy ORM with SQLite (migration-ready to PostgreSQL).
 """
+import logging
 from pathlib import Path
 
 from sqlalchemy import create_engine
@@ -11,11 +12,22 @@ from sqlalchemy.orm import sessionmaker
 
 from api.config import settings
 
+logger = logging.getLogger(__name__)
+
 # Create database engine
 if settings.database_url.startswith("sqlite"):
     url = make_url(settings.database_url)
     if url.database:
-        Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+        db_path = Path(url.database).expanduser()
+        parent_dir = db_path.parent
+        if not parent_dir.exists():
+            try:
+                parent_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                logger.warning(
+                    "No permission to create database directory %s. Ensure this path exists.",
+                    parent_dir,
+                )
 
 engine = create_engine(
     settings.database_url,
