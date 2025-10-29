@@ -68,3 +68,10 @@ htmlcov/
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# Exclude Python bytecode files
+__pycache__/
+*.py[co]
+
+# Exclude macOS-specific files
+.DS_Store
