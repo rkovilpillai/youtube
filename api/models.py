@@ -3,7 +3,7 @@ SQLAlchemy database models for YouTube Contextual Product Pipeline.
 Follows exact schema specifications from PROJECT_KNOWLEDGE_BASE.md.
 """
 from typing import Optional
-from sqlalchemy import Column, String, Text, Float, Enum, ForeignKey, DateTime, Integer, JSON
+from sqlalchemy import Column, String, Text, Float, Enum, ForeignKey, DateTime, Integer, JSON, BigInteger
 from sqlalchemy.orm import relationship
 from datetime import datetime
 import uuid
@@ -108,9 +108,9 @@ class Campaign(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
     # Neuro-contextual guidance
-    audience_intent = Column(String(50), nullable=True)
-    audience_persona = Column(String(100), nullable=True)
-    tone_profile = Column(String(150), nullable=True)
+    audience_intent = Column(Text, nullable=True)
+    audience_persona = Column(Text, nullable=True)
+    tone_profile = Column(Text, nullable=True)
     emotion_guidance = Column(JSON, nullable=True)
     interest_guidance = Column(JSON, nullable=True)
     guardrail_terms = Column(JSON, nullable=True)
@@ -264,11 +264,11 @@ class YouTubeVideo(Base):
     published_at = Column(DateTime, nullable=True)
     
     # Engagement metrics
-    view_count = Column(Integer, default=0)
-    like_count = Column(Integer, default=0)
-    comment_count = Column(Integer, default=0)
-    channel_view_count = Column(Integer, nullable=True)
-    channel_subscriber_count = Column(Integer, nullable=True)
+    view_count = Column(BigInteger, default=0)
+    like_count = Column(BigInteger, default=0)
+    comment_count = Column(BigInteger, default=0)
+    channel_view_count = Column(BigInteger, nullable=True)
+    channel_subscriber_count = Column(BigInteger, nullable=True)
     
     # Media
     thumbnail_url = Column(Text, nullable=True)
